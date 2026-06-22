@@ -1,18 +1,18 @@
 {
-  "name": "scrapedo-mcp-http",
+  "name": "scrapedo-mcp-server",
   "version": "1.0.0",
-  "description": "Scrape.do MCP server (Streamable HTTP) for hosting + Smithery URL publishing",
+  "description": "Scrape.do MCP server — lets AI assistants scrape any website with anti-bot bypass, JavaScript rendering, residential proxies, and geo-targeting.",
   "type": "module",
-  "private": true,
-  "engines": {
-    "node": ">=20"
-  },
+  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.0",
-    "express": "^4.19.2",
-    "zod": "^3.23.8"
+    "@modelcontextprotocol/sdk": "^1.11.0",
+    "express": "^4.21.2",
+    "zod": "^3.24.1"
   }
 }

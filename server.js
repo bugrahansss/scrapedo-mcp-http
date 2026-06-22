@@ -1,188 +1,161 @@
-import express from "express"
-import { z } from "zod"
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js"
+import express from "express";
+import { z } from "zod";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
-const SCRAPEDO_ENDPOINT = "https://api.scrape.do/"
+// ---- Config ----
+const SCRAPEDO_BASE = "https://api.scrape.do/";
+const MAX_CHARS = Number(process.env.MAX_RESPONSE_CHARS || 80000); // cap large pages
+const PORT = process.env.PORT || 3000;
 
-const TOOL_DESCRIPTION =
-  "Fetch the contents of any URL through Scrape.do — rotating residential/datacenter " +
-  "proxies, anti-bot bypass, and optional JavaScript rendering. Returns clean Markdown " +
-  "by default (ideal for LLMs, lower token usage) or raw HTML. Use this whenever you " +
-  "need live web content that a plain HTTP fetch would get blocked on (Cloudflare, " +
-  "DataDome, rate limits, geo-restrictions, JS-rendered pages, etc.)."
-
-// Read the user's Scrape.do token from the request.
-// Smithery (URL publishing) forwards config as query params by default,
-// so the token arrives as ?scrapedo_token=... . We also accept a base64
-// `config` JSON param, and fall back to an env var for local testing.
-function getToken(req) {
-  if (req.query.scrapedo_token) return String(req.query.scrapedo_token)
-  if (req.query.config) {
-    try {
-      const decoded = Buffer.from(String(req.query.config), "base64").toString("utf8")
-      const cfg = JSON.parse(decoded)
-      if (cfg && cfg.scrapedo_token) return String(cfg.scrapedo_token)
-    } catch {
-      // ignore malformed config
-    }
-  }
-  return process.env.SCRAPEDO_TOKEN || ""
+// Pull the user's Scrape.do token from the incoming request, with env fallback.
+// - Apify-style per-user token:  Authorization: Bearer <token>   (or  x-scrapedo-token: <token>)
+// - Testing / single-tenant:     falls back to the SCRAPEDO_TOKEN env var
+function resolveToken(req) {
+  const auth = req.headers["authorization"] || "";
+  if (auth.toLowerCase().startsWith("bearer ")) return auth.slice(7).trim();
+  if (req.headers["x-scrapedo-token"]) return String(req.headers["x-scrapedo-token"]).trim();
+  return process.env.SCRAPEDO_TOKEN || null;
 }
 
+// ---- Build a fresh MCP server instance (stateless: one per request) ----
 function buildServer(token) {
-  const server = new McpServer({ name: "scrapedo", version: "1.0.0" })
+  const server = new McpServer({ name: "scrapedo", version: "1.0.0" });
 
   server.registerTool(
     "scrape",
     {
       title: "Scrape a web page",
-      description: TOOL_DESCRIPTION,
+      description:
+        "Fetch the live contents of any public web page through Scrape.do. " +
+        "Automatically handles anti-bot systems (Cloudflare, DataDome, Akamai, PerimeterX), " +
+        "rotating datacenter/residential/mobile proxies, CAPTCHA solving, and optional " +
+        "JavaScript rendering. Returns the page as Markdown (best for reading and extraction) " +
+        "or raw HTML. Use this whenever you need the current content of a URL.",
       inputSchema: {
-        url: z.string().url().describe("The full URL to scrape, e.g. https://example.com/page"),
+        url: z
+          .string()
+          .url()
+          .describe("Full URL of the page to scrape, e.g. https://example.com/products"),
         output: z
           .enum(["markdown", "raw"])
           .default("markdown")
-          .describe("markdown = clean, LLM-friendly text (default); raw = the full HTML of the page"),
+          .describe("Response format. 'markdown' is cleaner and token-efficient for LLMs; 'raw' returns original HTML."),
         render: z
           .boolean()
           .default(false)
-          .describe("Set true for JavaScript-heavy / dynamically rendered pages"),
-        residential: z
+          .describe("Set true for JavaScript-heavy sites (React/Vue/Angular SPAs) that need a real browser. Costs more credits."),
+        super_proxy: z
           .boolean()
           .default(false)
-          .describe("Set true to route through residential & mobile proxies (maps to Scrape.do `super`)"),
+          .describe("Set true to route through residential & mobile proxies for tougher targets. Higher success rate, costs more credits."),
         geoCode: z
           .string()
           .optional()
-          .describe("Two-letter country code for the proxy location, e.g. us, uk, de. Defaults to us."),
+          .describe("Two-letter country code to scrape from a specific country, e.g. 'us', 'uk', 'de'. Leave empty for default."),
+        device: z
+          .enum(["desktop", "mobile", "tablet"])
+          .optional()
+          .describe("Device profile to emulate. Optional."),
+      },
+      annotations: {
+        title: "Scrape a web page",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
       },
     },
-    async ({ url, output, render, residential, geoCode }) => {
+    async ({ url, output, render, super_proxy, geoCode, device }) => {
       if (!token) {
         return {
           isError: true,
-          content: [
-            {
-              type: "text",
-              text:
-                "No Scrape.do token configured. Add your token in the connector settings. " +
-                "Don't have one? Get 1,000 free credits at https://dashboard.scrape.do/sign-up",
-            },
-          ],
-        }
+          content: [{ type: "text", text: "No Scrape.do token provided. Connect with your API token, or set SCRAPEDO_TOKEN on the server." }],
+        };
       }
 
-      const params = new URLSearchParams({
-        token,
-        url,
-        output,
-        render: String(render),
-        super: String(residential),
-      })
-      if (geoCode) params.set("geoCode", geoCode)
+      // Build the Scrape.do request. URLSearchParams handles URL-encoding of the target url.
+      const api = new URL(SCRAPEDO_BASE);
+      api.searchParams.set("token", token);
+      api.searchParams.set("url", url);
+      api.searchParams.set("output", output);
+      if (render) api.searchParams.set("render", "true");
+      if (super_proxy) api.searchParams.set("super", "true");
+      if (geoCode) api.searchParams.set("geoCode", geoCode);
+      if (device) api.searchParams.set("device", device);
 
       try {
-        const apiRes = await fetch(`${SCRAPEDO_ENDPOINT}?${params.toString()}`)
-        const body = await apiRes.text()
-        if (!apiRes.ok) {
-          return {
-            isError: true,
-            content: [
-              {
-                type: "text",
-                text:
-                  `Scrape.do request failed (HTTP ${apiRes.status}). ` +
-                  `Tip: try render=true and/or residential=true for protected sites. ` +
-                  `Response: ${body.slice(0, 500)}`,
-              },
-            ],
-          }
-        }
-        return { content: [{ type: "text", text: body }] }
+        const resp = await fetch(api.toString(), { headers: { accept: "*/*" } });
+        const text = await resp.text();
+
+        const truncated = text.length > MAX_CHARS;
+        const body = truncated
+          ? text.slice(0, MAX_CHARS) + `\n\n…[truncated ${text.length - MAX_CHARS} more characters]`
+          : text;
+
+        const flags = [
+          render ? "render" : null,
+          super_proxy ? "super" : null,
+          geoCode ? `geo:${geoCode}` : null,
+          device ? `device:${device}` : null,
+        ].filter(Boolean).join(" | ");
+
+        const header =
+          `Scrape.do → status ${resp.status} ${resp.statusText} | format: ${output}` +
+          (flags ? ` | ${flags}` : "") +
+          `\nURL: ${url}\n\n`;
+
+        return {
+          isError: !resp.ok,
+          content: [{ type: "text", text: header + body }],
+        };
       } catch (err) {
         return {
           isError: true,
-          content: [
-            {
-              type: "text",
-              text: `Network error calling Scrape.do: ${err instanceof Error ? err.message : String(err)}`,
-            },
-          ],
-        }
+          content: [{ type: "text", text: `Request failed: ${err?.message || String(err)}` }],
+        };
       }
-    },
-  )
+    }
+  );
 
-  return server
+  return server;
 }
 
-const app = express()
-app.use(express.json())
+// ---- HTTP layer ----
+const app = express();
+app.use(express.json({ limit: "4mb" }));
 
-// MCP endpoint (stateless: a fresh server/transport per request)
+// Simple health check (handy for Render + sanity in a browser)
+app.get("/", (_req, res) => {
+  res.json({ ok: true, server: "scrapedo-mcp", transport: "streamable-http", endpoint: "/mcp" });
+});
+
+// Streamable HTTP — stateless: a fresh server + transport per request
 app.post("/mcp", async (req, res) => {
   try {
-    const token = getToken(req)
-    const server = buildServer(token)
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined })
+    const token = resolveToken(req);
+    const server = buildServer(token);
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
-      transport.close()
-      server.close()
-    })
-    await server.connect(transport)
-    await transport.handleRequest(req, res, req.body)
+      transport.close();
+      server.close();
+    });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
   } catch (err) {
-    console.error("MCP request error:", err)
+    console.error("MCP request error:", err);
     if (!res.headersSent) {
-      res.status(500).json({
-        jsonrpc: "2.0",
-        error: { code: -32603, message: "Internal server error" },
-        id: null,
-      })
+      res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal server error" }, id: null });
     }
   }
-})
+});
 
+// Stateless mode doesn't use server-initiated GET streams or DELETE
 const methodNotAllowed = (_req, res) =>
-  res.status(405).json({
-    jsonrpc: "2.0",
-    error: { code: -32000, message: "Method not allowed. Use POST." },
-    id: null,
-  })
-app.get("/mcp", methodNotAllowed)
-app.delete("/mcp", methodNotAllowed)
+  res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null });
+app.get("/mcp", methodNotAllowed);
+app.delete("/mcp", methodNotAllowed);
 
-// Static server card — lets Smithery read metadata even if a live scan times out
-app.get("/.well-known/mcp/server-card.json", (_req, res) => {
-  res.json({
-    serverInfo: { name: "scrapedo", version: "1.0.0" },
-    tools: [
-      {
-        name: "scrape",
-        description: TOOL_DESCRIPTION,
-        inputSchema: {
-          type: "object",
-          required: ["url"],
-          properties: {
-            url: { type: "string" },
-            output: { type: "string", enum: ["markdown", "raw"] },
-            render: { type: "boolean" },
-            residential: { type: "boolean" },
-            geoCode: { type: "string" },
-          },
-        },
-      },
-    ],
-    resources: [],
-    prompts: [],
-  })
-})
-
-// Health check / friendly root
-app.get("/", (_req, res) =>
-  res.type("text").send("Scrape.do MCP server is running. MCP endpoint: POST /mcp"),
-)
-
-const port = process.env.PORT || 8080
-app.listen(port, () => console.log(`Scrape.do MCP server listening on port ${port}`))
+app.listen(PORT, () => {
+  console.log(`Scrape.do MCP server listening on :${PORT}  (POST /mcp)`);
+});
